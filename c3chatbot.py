@@ -6,6 +6,7 @@ import numpy as np
 import faiss
 import requests
 import threading
+import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request
@@ -28,6 +29,7 @@ DB_NAME           = os.getenv("DB_NAME")
 DB_USER           = os.getenv("DB_USER")
 DB_PASS           = os.getenv("DB_PASS")
 NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN")
+MEMORY_DB        = os.getenv("MEMORY_DB", "chatbot.db")
 if not NGROK_AUTH_TOKEN:
     raise RuntimeError("Missing NGROK_AUTH_TOKEN in .env")
 # Configure pyngrok with it:
@@ -47,7 +49,33 @@ if missing:
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ----------------------------------------------------------------------------
-# 1. Safe SQL helper for TSD.SystemLoss
+# 1. SQLite setup for persistent memory
+# ----------------------------------------------------------------------------
+
+def get_memory_conn():
+    conn = sqlite3.connect(MEMORY_DB, check_same_thread=False)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS conversations ("
+        "psid TEXT, role TEXT, text TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS posts ("
+        "post_id TEXT PRIMARY KEY,"
+        "message TEXT,"
+        "summary TEXT,"
+        "embedding BLOB,"
+        "ts DATETIME"
+        ")"
+    )
+    conn.commit()
+    return conn
+
+memory_conn = get_memory_conn()
+
+
+# ----------------------------------------------------------------------------
+# 2. Safe SQL helper for TSD.SystemLoss
 # ----------------------------------------------------------------------------
 def get_db_conn():
     conn_str = (
@@ -95,7 +123,7 @@ sql_function = {
 }
 
 # ----------------------------------------------------------------------------
-# 2. Webhook registration (runs after Flask is up)
+# 3. Webhook registration (runs after Flask is up)
 # ----------------------------------------------------------------------------
 def register_webhook():
     # 1) Wait up to ~10s for Flask to start responding on /health
@@ -139,7 +167,7 @@ def register_webhook():
     print(" * Facebook webhook registered:", resp.json())
 
 # ----------------------------------------------------------------------------
-# 3. Knowledge base & FAISS setup (chunks omitted)
+# 4. Knowledge base & FAISS setup (chunks omitted)
 # ----------------------------------------------------------------------------
 knowledge_chunks = [
 
@@ -408,7 +436,70 @@ vectors = [np.array(d.embedding, dtype=np.float32) for d in emb_resp.data]
 dim = vectors[0].shape[0]
 faiss_idx = faiss.IndexFlatL2(dim)
 faiss_idx.add(np.stack(vectors))
+
+def load_saved_posts():
+    cur = memory_conn.execute("SELECT summary, embedding FROM posts")
+    for summary, emb_blob in cur.fetchall():
+        vec = np.frombuffer(emb_blob, dtype=np.float32)
+        knowledge_chunks.append(summary)
+        vectors.append(vec)
+        faiss_idx.add(vec.reshape(1, -1))
+
+load_saved_posts()
 print("Knowledge base ready ✔")
+
+def update_fb_posts():
+    url = "https://graph.facebook.com/v17.0/CEBECOIIIToledo/posts"
+    params = {
+        "access_token": PAGE_ACCESS_TOKEN,
+        "fields": "message,created_time,status_type,is_live",
+        "limit": 5,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        posts = resp.json().get("data", [])
+    except Exception as e:
+        print(f"⚠️ Failed to fetch FB posts: {e}")
+        return
+
+    for p in posts:
+        if p.get("is_live") or str(p.get("status_type", "")).startswith("live"):
+            continue
+        post_id = p.get("id")
+        message = p.get("message", "").strip()
+        if not post_id or not message:
+            continue
+        cur = memory_conn.execute("SELECT 1 FROM posts WHERE post_id=?", (post_id,))
+        if cur.fetchone():
+            continue
+
+        prompt = [
+            {"role": "system", "content": "Summarize the Facebook post in 2 sentences."},
+            {"role": "user", "content": message},
+        ]
+        try:
+            summ = openai_client.chat.completions.create(model="gpt-3.5-turbo", messages=prompt).choices[0].message.content.strip()
+            emb = openai_client.embeddings.create(input=summ, model="text-embedding-ada-002").data[0].embedding
+        except Exception as e:
+            print(f"⚠️ Failed to summarize or embed post {post_id}: {e}")
+            continue
+        vec = np.array(emb, dtype=np.float32)
+        with memory_conn:
+            memory_conn.execute(
+                "INSERT INTO posts (post_id, message, summary, embedding, ts) VALUES (?,?,?,?,?)",
+                (post_id, message, summ, vec.tobytes(), p.get("created_time"))
+            )
+        knowledge_chunks.append(summ)
+        vectors.append(vec)
+        faiss_idx.add(vec.reshape(1, -1))
+
+def weekly_updater():
+    while True:
+        time.sleep(7 * 24 * 3600)
+        update_fb_posts()
+
+update_fb_posts()
 
 def top_chunks(query, k=3):
     qvec = np.array(
@@ -427,21 +518,40 @@ def top_chunks(query, k=3):
     return out
 
 # ----------------------------------------------------------------------------
-# 4. Conversation memory
+# 5. Conversation memory
 # ----------------------------------------------------------------------------
 MAX_TURNS = 10
-convo = {}
 
 def remember(psid, role, text):
-    convo.setdefault(psid, []).append({"role": role, "text": text})
-    if len(convo[psid]) > MAX_TURNS * 2:
-        convo[psid] = convo[psid][-MAX_TURNS * 2:]
+    with memory_conn:
+        memory_conn.execute(
+            "INSERT INTO conversations (psid, role, text) VALUES (?, ?, ?)",
+            (psid, role, text)
+        )
+        rows = memory_conn.execute(
+            "SELECT rowid FROM conversations WHERE psid=? ORDER BY ts DESC",
+            (psid,)
+        ).fetchall()
+        if len(rows) > MAX_TURNS * 2:
+            excess = rows[MAX_TURNS * 2:]
+            ids = [str(r[0]) for r in excess]
+            memory_conn.execute(
+                f"DELETE FROM conversations WHERE rowid IN ({','.join(ids)})"
+            )
+
+def get_conversation(psid):
+    cur = memory_conn.execute(
+        "SELECT role, text FROM conversations WHERE psid=? ORDER BY ts ASC",
+        (psid,)
+    )
+    return [{"role": r[0], "text": r[1]} for r in cur.fetchall()]
 
 def reset_memory(psid):
-    convo.pop(psid, None)
+    with memory_conn:
+        memory_conn.execute("DELETE FROM conversations WHERE psid=?", (psid,))
 
 # ----------------------------------------------------------------------------
-# 5. Intent classifier
+# 6. Intent classifier
 # ----------------------------------------------------------------------------
 def intent(msg):
     txt = msg.lower()
@@ -455,7 +565,7 @@ def intent(msg):
 
 
 # ----------------------------------------------------------------------------
-# 6. Flask app & webhook handlers
+# 7. Flask app & webhook handlers
 # ----------------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -488,7 +598,7 @@ def fb_webhook():
     return "OK", 200
 
 # ----------------------------------------------------------------------------
-# 7. Reply generation with function‐calling
+# 8. Reply generation with function‐calling
 # ----------------------------------------------------------------------------
 def generate_reply(psid, user_msg):
     remember(psid, "user", user_msg)
@@ -545,7 +655,7 @@ Registered senior citizens, PWDs, or life-support households also get an automat
     )
 
     messages = [{"role": "system", "content": system}]
-    for turn in convo.get(psid, []):
+    for turn in get_conversation(psid):
         messages.append({"role": turn["role"], "content": turn["text"]})
     messages.append({"role": "user", "content": user_msg})
 
@@ -586,7 +696,7 @@ Registered senior citizens, PWDs, or life-support households also get an automat
     return answer
 
 # ----------------------------------------------------------------------------
-# 8. Send replies via Messenger API
+# 9. Send replies via Messenger API
 # ----------------------------------------------------------------------------
 def send(psid, text):
     requests.post(
@@ -600,4 +710,5 @@ def send(psid, text):
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     threading.Thread(target=register_webhook, daemon=True).start()
+    threading.Thread(target=weekly_updater, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
